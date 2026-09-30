@@ -285,6 +285,7 @@ elseif(ROS_VERSION STREQUAL "ROS2")
     find_package(geometry_msgs REQUIRED)
     find_package(tf2_geometry_msgs REQUIRED)
     find_package(ament_index_cpp REQUIRED)
+    find_package(std_srvs REQUIRED)
 
     # ---- AE/AWB debug services ----
     # Generate C++ bindings for the 4 .srv files in srv/. The generated
@@ -416,6 +417,16 @@ elseif(ROS_VERSION STREQUAL "ROS2")
         message_filters
     )
 
+    add_executable(pcd_map_saver_node src/pcd_map_saver_node.cpp)
+    target_link_libraries(pcd_map_saver_node
+        ${PCL_LIBRARIES}
+    )
+    ament_target_dependencies(pcd_map_saver_node
+        rclcpp
+        sensor_msgs
+        std_srvs
+    )
+
     # Installation rules - ensure all install targets are defined before ament_package()
     # Install executable
     install(TARGETS 
@@ -423,6 +434,7 @@ elseif(ROS_VERSION STREQUAL "ROS2")
         pcd2depth_ros2_node
         cloud_reprojection_ros2_node
         image_overlay_node
+        pcd_map_saver_node
         depth_image_ros2_node_lib
         pointcloud_depth_converter_ros2
         cloud_reprojector_ros2

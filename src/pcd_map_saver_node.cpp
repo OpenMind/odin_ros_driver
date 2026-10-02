@@ -20,18 +20,18 @@ limitations under the License.
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
-#include <pcl/io/pcd_io.h>
-#include <pcl/point_cloud.h>
-#include <pcl/point_types.h>
-
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 class PcdMapSaverNode : public rclcpp::Node
 {
@@ -73,52 +73,93 @@ public:
                     topic_.c_str(), leaf_size_, output_dir_.c_str(), file_name_.c_str());
     }
 
-    // Writes the accumulated map; returns false if empty or on write error.
+    // Streams the accumulated map to a binary PCD without copying it; returns false if empty or on write error.
     bool save(std::string& out_path)
     {
-        pcl::PointCloud<pcl::PointXYZRGB> cloud;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            cloud.reserve(voxels_.size());
-            for (const auto& kv : voxels_) {
-                const Voxel& v = kv.second;
-                const double n = static_cast<double>(v.count);
-                pcl::PointXYZRGB p;
-                p.x = static_cast<float>(v.x / n);
-                p.y = static_cast<float>(v.y / n);
-                p.z = static_cast<float>(v.z / n);
-                p.r = static_cast<uint8_t>(v.r / n);
-                p.g = static_cast<uint8_t>(v.g / n);
-                p.b = static_cast<uint8_t>(v.b / n);
-                cloud.push_back(p);
-            }
-        }
-        if (cloud.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (voxels_.empty()) {
             RCLCPP_WARN(this->get_logger(), "No points received on %s, nothing to save", topic_.c_str());
             return false;
         }
-        cloud.width = static_cast<uint32_t>(cloud.size());
-        cloud.height = 1;
-        cloud.is_dense = true;
 
         std::error_code ec;
         std::filesystem::create_directories(output_dir_, ec);
         out_path = (std::filesystem::path(output_dir_) / file_name_).string();
-        if (pcl::io::savePCDFileBinary(out_path, cloud) != 0) {
+        const std::string tmp_path = out_path + ".tmp";
+
+        std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+        out << "# .PCD v0.7 - Point Cloud Data file format\n"
+            << "VERSION 0.7\n"
+            << "FIELDS x y z rgb\n"
+            << "SIZE 4 4 4 4\n"
+            << "TYPE F F F U\n"
+            << "COUNT 1 1 1 1\n"
+            << "WIDTH " << voxels_.size() << "\n"
+            << "HEIGHT 1\n"
+            << "VIEWPOINT 0 0 0 1 0 0 0\n"
+            << "POINTS " << voxels_.size() << "\n"
+            << "DATA binary\n";
+
+        std::vector<PcdPoint> batch;
+        batch.reserve(kWriteBatch);
+        for (const auto& kv : voxels_) {
+            const Voxel& v = kv.second;
+            PcdPoint p;
+            p.x = cellCenter(kv.first, 42, v.offset[0]);
+            p.y = cellCenter(kv.first, 21, v.offset[1]);
+            p.z = cellCenter(kv.first, 0, v.offset[2]);
+            p.rgb = 0xff000000u | (uint32_t(v.rgb[0]) << 16) | (uint32_t(v.rgb[1]) << 8) | v.rgb[2];
+            batch.push_back(p);
+            if (batch.size() == kWriteBatch) {
+                out.write(reinterpret_cast<const char*>(batch.data()), batch.size() * sizeof(PcdPoint));
+                batch.clear();
+            }
+        }
+        out.write(reinterpret_cast<const char*>(batch.data()), batch.size() * sizeof(PcdPoint));
+        out.close();
+
+        if (out) {
+            std::filesystem::rename(tmp_path, out_path, ec);
+        }
+        if (!out || ec) {
             RCLCPP_ERROR(this->get_logger(), "Failed to write %s", out_path.c_str());
+            std::filesystem::remove(tmp_path, ec);
             return false;
         }
-        RCLCPP_INFO(this->get_logger(), "Saved RGB map with %zu points to %s", cloud.size(), out_path.c_str());
+        RCLCPP_INFO(this->get_logger(), "Saved RGB map with %zu points to %s", voxels_.size(), out_path.c_str());
         return true;
     }
 
 private:
     struct Voxel
     {
-        double x = 0, y = 0, z = 0;
-        uint64_t r = 0, g = 0, b = 0;
-        uint32_t count = 0;
+        uint8_t offset[3];
+        uint8_t rgb[3];
+        uint16_t count;
     };
+    static_assert(sizeof(Voxel) == 8, "Voxel must stay 8 bytes");
+
+    struct PcdPoint
+    {
+        float x, y, z;
+        uint32_t rgb;
+    };
+    static_assert(sizeof(PcdPoint) == 16, "PCD point layout must match the header");
+
+    static constexpr size_t kWriteBatch = 1 << 16;
+    static constexpr int64_t kKeyOffset = 1 << 20;
+    static constexpr uint64_t kKeyMask = (1ULL << 21) - 1;
+
+    static void accumulate(uint8_t& mean, int sample, int n)
+    {
+        mean = static_cast<uint8_t>((mean * (n - 1) + sample + n / 2) / n);
+    }
+
+    float cellCenter(uint64_t key, int shift, uint8_t offset) const
+    {
+        const int64_t cell = static_cast<int64_t>((key >> shift) & kKeyMask) - kKeyOffset;
+        return static_cast<float>((cell + (offset + 0.5) / 256.0) * leaf_size_);
+    }
 
     void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
     {
@@ -147,12 +188,17 @@ private:
             const float rgb = *it_rgb;
             std::memcpy(&packed, &rgb, sizeof(packed));
 
-            Voxel& v = voxels_[voxelKey(x * inv_leaf, y * inv_leaf, z * inv_leaf)];
-            v.x += x; v.y += y; v.z += z;
-            v.r += (packed >> 16) & 0xff;
-            v.g += (packed >> 8) & 0xff;
-            v.b += packed & 0xff;
-            ++v.count;
+            const double fx = x * inv_leaf, fy = y * inv_leaf, fz = z * inv_leaf;
+            const double cx = std::floor(fx), cy = std::floor(fy), cz = std::floor(fz);
+            Voxel& v = voxels_[voxelKey(cx, cy, cz)];
+            if (v.count < std::numeric_limits<uint16_t>::max()) ++v.count;
+            const int n = v.count;
+            accumulate(v.offset[0], std::min(255, static_cast<int>((fx - cx) * 256)), n);
+            accumulate(v.offset[1], std::min(255, static_cast<int>((fy - cy) * 256)), n);
+            accumulate(v.offset[2], std::min(255, static_cast<int>((fz - cz) * 256)), n);
+            accumulate(v.rgb[0], (packed >> 16) & 0xff, n);
+            accumulate(v.rgb[1], (packed >> 8) & 0xff, n);
+            accumulate(v.rgb[2], packed & 0xff, n);
         }
 
         if (++msg_count_ % 100 == 0) {
@@ -161,13 +207,11 @@ private:
     }
 
     // Packs 21 bits per axis (about +/-52 km at 5 cm) into one 64-bit key.
-    static uint64_t voxelKey(double fx, double fy, double fz)
+    static uint64_t voxelKey(double cx, double cy, double cz)
     {
-        constexpr int64_t kOffset = 1 << 20;
-        constexpr uint64_t kMask = (1ULL << 21) - 1;
-        const uint64_t ix = static_cast<uint64_t>(static_cast<int64_t>(std::floor(fx)) + kOffset) & kMask;
-        const uint64_t iy = static_cast<uint64_t>(static_cast<int64_t>(std::floor(fy)) + kOffset) & kMask;
-        const uint64_t iz = static_cast<uint64_t>(static_cast<int64_t>(std::floor(fz)) + kOffset) & kMask;
+        const uint64_t ix = static_cast<uint64_t>(static_cast<int64_t>(cx) + kKeyOffset) & kKeyMask;
+        const uint64_t iy = static_cast<uint64_t>(static_cast<int64_t>(cy) + kKeyOffset) & kKeyMask;
+        const uint64_t iz = static_cast<uint64_t>(static_cast<int64_t>(cz) + kKeyOffset) & kKeyMask;
         return (ix << 42) | (iy << 21) | iz;
     }
 

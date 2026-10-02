@@ -418,9 +418,6 @@ elseif(ROS_VERSION STREQUAL "ROS2")
     )
 
     add_executable(pcd_map_saver_node src/pcd_map_saver_node.cpp)
-    target_link_libraries(pcd_map_saver_node
-        ${PCL_LIBRARIES}
-    )
     ament_target_dependencies(pcd_map_saver_node
         rclcpp
         sensor_msgs

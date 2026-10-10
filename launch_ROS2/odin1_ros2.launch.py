@@ -1,10 +1,11 @@
 
-# USAGE: ros2 launch odin_ros_driver odin1_ros2.launch.py [pcd:=true] [pcd_voxel:=0.02]
+# USAGE: ros2 launch odin_ros_driver odin1_ros2.launch.py [pcd:=true] [pcd_voxel:=0.02] [record_bag:=true]
 import os
+import time
 import yaml 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -24,6 +25,15 @@ def get_odin_runtime_dir():
     if home:
         return os.path.join(home, '.ros', 'odin_ros_driver')
     return '/tmp/odin_ros_driver'
+
+
+def get_default_bag_dir():
+    # Same root as pcd_map_saver_node's default: {ws}/src/odin_ros_driver/map/bag
+    prefix = os.environ.get('COLCON_PREFIX_PATH', '')
+    pos = prefix.find('/install')
+    if pos != -1:
+        return os.path.join(prefix[:pos], 'src', 'odin_ros_driver', 'map', 'bag')
+    return os.path.join(os.environ.get('HOME', '/tmp'), 'odin_maps', 'bag')
 
 
 def generate_launch_description():
@@ -57,6 +67,23 @@ def generate_launch_description():
         'pcd_voxel',
         default_value='0.05',
         description='Voxel size in meters for the PCD map (smaller = denser, more RAM)'
+    )
+
+    # Record camera trajectory + images to a rosbag
+    record_bag_arg = DeclareLaunchArgument(
+        'record_bag',
+        default_value='false',
+        description='Record odometry, wiwc, tf and compressed images to a rosbag'
+    )
+    bag_dir_arg = DeclareLaunchArgument(
+        'bag_dir',
+        default_value=get_default_bag_dir(),
+        description='Directory for recorded bags (each run gets camera_traj_<timestamp>)'
+    )
+    bag_split_sec_arg = DeclareLaunchArgument(
+        'bag_split_sec',
+        default_value='30',
+        description='Split the bag into a new file every N seconds (0 = single file)'
     )
 
     # Create main node
@@ -120,6 +147,20 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('pcd'))
     )
 
+    # Rosbag recorder - only started with record_bag:=true
+    bag_name = 'camera_traj_' + time.strftime('%Y%m%d_%H%M%S')
+    bag_record = ExecuteProcess(
+        cmd=['ros2', 'bag', 'record',
+             '-o', [LaunchConfiguration('bag_dir'), '/' + bag_name],
+             # Split into a new file every N s so a crash loses at most the open segment
+             '--max-bag-duration', LaunchConfiguration('bag_split_sec'),
+             '--topics',
+             '/odin1/odometry', '/odin1/wiwc', '/tf', '/odin1/image/compressed'],
+        output='screen',
+        sigterm_timeout='15',
+        condition=IfCondition(LaunchConfiguration('record_bag'))
+    )
+
     # Create RViz2 node - loads specified configuration file
     rviz_node = Node(
         package='rviz2',
@@ -135,11 +176,15 @@ def generate_launch_description():
     ld.add_action(rviz_config_arg)  # Add RViz configuration argument
     ld.add_action(pcd_arg)
     ld.add_action(pcd_voxel_arg)
+    ld.add_action(record_bag_arg)
+    ld.add_action(bag_dir_arg)
+    ld.add_action(bag_split_sec_arg)
     ld.add_action(host_sdk_node)
     ld.add_action(pcd2depth_node)
     ld.add_action(cloud_reprojection_node)
     ld.add_action(image_overlay_node)
     ld.add_action(pcd_map_saver_node)
+    ld.add_action(bag_record)
     ld.add_action(rviz_node)  # Add RViz node
     
     return ld

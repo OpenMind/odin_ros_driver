@@ -18,6 +18,7 @@ Output: map/pcd/rgb_map_<stamp>_bag_<voxel>m.pcd (binary PCD, FIELDS x y z rgb)
 """
 import argparse
 import os
+import re
 import shutil
 import sys
 import time
@@ -73,6 +74,32 @@ def resolve_bag(name, bag_dir):
         if cand.is_dir():
             return cand.resolve()
     sys.exit(f"Bag not found: tried {name}, {bag_dir}/{name}, {bag_dir}/{BAG_PREFIX}{name}")
+
+
+def bag_files(bag):
+    """Split files in recording order: from metadata.yaml, or by index suffix if it is missing (crashed recording)."""
+    if (bag / "metadata.yaml").exists():
+        reader = rosbag2_py.SequentialReader()
+        reader.open(rosbag2_py.StorageOptions(uri=str(bag), storage_id=""),
+                    rosbag2_py.ConverterOptions("", ""))
+        files = [bag / p for p in reader.get_metadata().relative_file_paths]
+    else:
+        files = sorted((p for p in bag.iterdir() if p.suffix in (".mcap", ".db3")),
+                       key=lambda p: int(re.search(r"_(\d+)$", p.stem).group(1))
+                       if re.search(r"_(\d+)$", p.stem) else 0)
+    files = [f for f in files if f.exists()]
+    if not files:
+        sys.exit(f"No .mcap/.db3 files in {bag}")
+    return files
+
+
+def fmt_duration(sec):
+    sec = int(sec)
+    if sec >= 3600:
+        return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+    if sec >= 60:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec}s"
 
 
 def cloud_dtype(msg):
@@ -172,47 +199,59 @@ def main():
     shutil.rmtree(tmp_dir, ignore_errors=True)
     tmp_dir.mkdir()
 
-    reader = rosbag2_py.SequentialReader()
-    reader.open(rosbag2_py.StorageOptions(uri=str(bag), storage_id=""),
-                rosbag2_py.ConverterOptions("", ""))
-    n_msgs = next((t.message_count for t in reader.get_metadata().topics_with_message_count
-                   if t.topic_metadata.name == args.topic), 0)
-    if n_msgs == 0:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        sys.exit(f"No {args.topic} messages in {bag} (recorded before cloud_slam was added to the bag?)")
-    reader.set_filter(rosbag2_py.StorageFilter(topics=[args.topic]))
-    print(f"Bag:    {bag}\nTopic:  {args.topic} ({n_msgs} clouds)\nVoxel:  {args.voxel_size} m\nOutput: {out_path}")
+    files = bag_files(bag)
+    total_bytes = sum(f.stat().st_size for f in files) or 1
+    print(f"Bag:    {bag} ({len(files)} files, {total_bytes / 1e9:.1f} GB)\n"
+          f"Topic:  {args.topic}\nVoxel:  {args.voxel_size} m\nOutput: {out_path}")
 
     t0 = time.time()
     try:
-        # Pass 1: read clouds, pre-merge in batches, spill to tile files
+        # Pass 1: read clouds file by file, pre-merge in batches, spill to tile files
         spiller = TileSpiller(tmp_dir, args.voxel_size, args.tile_size)
-        dtype, done, raw = None, 0, 0
-        while reader.has_next():
-            _, data, _ = reader.read_next()
-            msg = deserialize_message(data, PointCloud2)
-            done += 1
-            n = msg.width * msg.height
-            if n == 0:
-                continue
-            if dtype is None or dtype.itemsize != msg.point_step:
-                dtype = cloud_dtype(msg)
-            if msg.row_step != msg.width * msg.point_step:
-                sys.exit("Clouds with row padding are not supported")
-            pts = np.frombuffer(msg.data, dtype, count=n)
-            xyz = np.stack([pts["x"], pts["y"], pts["z"]], axis=1).astype(np.float64)
-            ok = np.isfinite(xyz).all(axis=1)
-            spiller.add(xyz[ok], pts["rgb"][ok])
-            raw += int(ok.sum())
-            if done % 100 == 0 or done == n_msgs:
-                print(f"  read {done}/{n_msgs} clouds, {raw / 1e6:.1f}M points ({time.time() - t0:.0f} s)", flush=True)
+        dtype, clouds, raw, done_bytes = None, 0, 0, 0
+        width = len(str(len(files)))
+        for i, path in enumerate(files, 1):
+            print(f"[{i:>{width}}/{len(files)}] processing {path.name} ...", flush=True)
+            reader = rosbag2_py.SequentialReader()
+            reader.open(rosbag2_py.StorageOptions(uri=str(path), storage_id=""),
+                        rosbag2_py.ConverterOptions("", ""))
+            reader.set_filter(rosbag2_py.StorageFilter(topics=[args.topic]))
+            file_clouds = 0
+            while reader.has_next():
+                _, data, _ = reader.read_next()
+                msg = deserialize_message(data, PointCloud2)
+                file_clouds += 1
+                n = msg.width * msg.height
+                if n == 0:
+                    continue
+                if dtype is None or dtype.itemsize != msg.point_step:
+                    dtype = cloud_dtype(msg)
+                if msg.row_step != msg.width * msg.point_step:
+                    sys.exit("Clouds with row padding are not supported")
+                pts = np.frombuffer(msg.data, dtype, count=n)
+                xyz = np.stack([pts["x"], pts["y"], pts["z"]], axis=1).astype(np.float64)
+                ok = np.isfinite(xyz).all(axis=1)
+                spiller.add(xyz[ok], pts["rgb"][ok])
+                raw += int(ok.sum())
+            del reader
+            clouds += file_clouds
+            done_bytes += path.stat().st_size
+            elapsed = time.time() - t0
+            eta = elapsed * (total_bytes - done_bytes) / done_bytes if done_bytes else 0
+            print(f"[{i:>{width}}/{len(files)}] {file_clouds} clouds | total {clouds} clouds, "
+                  f"{raw / 1e6:.1f}M points | {fmt_duration(elapsed)} elapsed, ~{fmt_duration(eta)} left",
+                  flush=True)
         spiller.flush()
-        del reader
+        if clouds == 0:
+            sys.exit(f"No {args.topic} messages in {bag} (recorded before cloud_slam was added to the bag?)")
+        print(f"[{len(files)}/{len(files)}] ---- Completed reading: {clouds} clouds, {raw / 1e6:.1f}M points "
+              f"in {fmt_duration(time.time() - t0)}", flush=True)
 
         # Pass 2: merge each tile and stream its voxels into the PCD body
         tiles = sorted(tmp_dir.glob("tile_*.bin"))
         body_path = tmp_dir / "body.bin"
         count = 0
+        print(f"Merging {len(tiles)} map tiles ...", flush=True)
         with open(body_path, "wb") as body:
             for i, tile in enumerate(tiles, 1):
                 vox = merge_tile(tile)
@@ -224,7 +263,8 @@ def main():
                 pts.tofile(body)
                 count += len(pts)
                 if i % 50 == 0 or i == len(tiles):
-                    print(f"  merged {i}/{len(tiles)} tiles, {count / 1e6:.2f}M voxels", flush=True)
+                    print(f"  merged {i}/{len(tiles)} tiles, {count / 1e6:.2f}M voxels "
+                          f"({fmt_duration(time.time() - t0)} elapsed)", flush=True)
 
         if count == 0:
             sys.exit("No valid points found, nothing written")

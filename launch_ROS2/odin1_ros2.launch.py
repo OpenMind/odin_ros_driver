@@ -144,6 +144,9 @@ def generate_launch_description():
         parameters=[{
             'voxel_leaf_size': ParameterValue(LaunchConfiguration('pcd_voxel'), value_type=float)
         }],
+        # Writing a large map on Ctrl+C takes minutes; don't let launch SIGKILL it mid-write
+        sigterm_timeout='600',
+        sigkill_timeout='600',
         condition=IfCondition(LaunchConfiguration('pcd'))
     )
 

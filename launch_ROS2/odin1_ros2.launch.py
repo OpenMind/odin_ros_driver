@@ -73,7 +73,7 @@ def generate_launch_description():
     record_bag_arg = DeclareLaunchArgument(
         'record_bag',
         default_value='false',
-        description='Record odometry, wiwc, tf and compressed images to a rosbag'
+        description='Record odometry, wiwc, tf, compressed images and cloud_slam to a rosbag'
     )
     bag_dir_arg = DeclareLaunchArgument(
         'bag_dir',
@@ -158,7 +158,9 @@ def generate_launch_description():
              # Split into a new file every N s so a crash loses at most the open segment
              '--max-bag-duration', LaunchConfiguration('bag_split_sec'),
              '--topics',
-             '/odin1/odometry', '/odin1/wiwc', '/tf', '/odin1/image/compressed'],
+             '/odin1/odometry', '/odin1/wiwc', '/tf', '/odin1/image/compressed',
+             # Colored odom-frame clouds, so the dense map can be rebuilt offline
+             '/odin1/cloud_slam'],
         output='screen',
         sigterm_timeout='15',
         condition=IfCondition(LaunchConfiguration('record_bag'))

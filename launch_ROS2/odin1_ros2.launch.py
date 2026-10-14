@@ -86,6 +86,13 @@ def generate_launch_description():
         description='Split the bag into a new file every N seconds (0 = single file)'
     )
 
+    # Print RAM/disk usage and auto-save the PCD before RAM runs out
+    monitor_arg = DeclareLaunchArgument(
+        'monitor',
+        default_value='true',
+        description='Print RAM/disk usage every 5 s and auto-save the PCD at 90% RAM'
+    )
+
     # Create main node
     host_sdk_node = Node(
         package='odin_ros_driver',
@@ -166,6 +173,19 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('record_bag'))
     )
 
+    resource_monitor_node = Node(
+        package='odin_ros_driver',
+        executable='resource_monitor.py',
+        name='resource_monitor',
+        output='screen',
+        parameters=[{
+            'disk_path': LaunchConfiguration('bag_dir'),
+            'period_sec': 5.0,
+            'ram_save_percent': 90.0,
+        }],
+        condition=IfCondition(LaunchConfiguration('monitor'))
+    )
+
     # Create RViz2 node - loads specified configuration file
     rviz_node = Node(
         package='rviz2',
@@ -184,12 +204,14 @@ def generate_launch_description():
     ld.add_action(record_bag_arg)
     ld.add_action(bag_dir_arg)
     ld.add_action(bag_split_sec_arg)
+    ld.add_action(monitor_arg)
     ld.add_action(host_sdk_node)
     ld.add_action(pcd2depth_node)
     ld.add_action(cloud_reprojection_node)
     ld.add_action(image_overlay_node)
     ld.add_action(pcd_map_saver_node)
     ld.add_action(bag_record)
+    ld.add_action(resource_monitor_node)
     ld.add_action(rviz_node)  # Add RViz node
     
     return ld

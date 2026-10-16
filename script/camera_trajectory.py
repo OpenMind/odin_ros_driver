@@ -2,7 +2,7 @@
 """Replay an Odin1 recording in Rerun: colored PCD map + camera trajectory + camera image.
 
 Inputs (recorded with `odin1_ros2.launch.py pcd:=true record_bag:=true`):
-  rgb_map_<stamp>.pcd        colored map from pcd_map_saver_node (odom frame)
+  <map_name>_<stamp>.pcd     colored map from pcd_map_saver_node (odom frame)
   camera_traj_<stamp>/       rosbag with /tf (odom -> camera_0) and /odin1/image/compressed
   calib.yaml                 optional, camera intrinsics; enables undistortion and a correct frustum
 
@@ -43,13 +43,13 @@ def find_inputs(args):
     pcd = Path(args.pcd) if args.pcd else None
     if pcd is None:
         stamp = bag.name.removeprefix("camera_traj_")
-        pcds = [p for d in search + [bag.parent] if d.is_dir() for p in d.glob("rgb_map_*.pcd")]
-        same = [p for p in pcds if p.stem == f"rgb_map_{stamp}"]
+        pcds = [p for d in search + [bag.parent] if d.is_dir() for p in d.glob("*.pcd")]
+        same = [p for p in pcds if p.stem.endswith(f"_{stamp}")]
         if same:
             pcd = same[0]
         elif pcds:
-            pcd = max(pcds, key=lambda p: p.name)
-            print(f"warning: no rgb_map_{stamp}.pcd, using newest PCD {pcd.name}")
+            pcd = max(pcds, key=lambda p: p.stat().st_mtime)
+            print(f"warning: no *_{stamp}.pcd, using newest PCD {pcd.name}")
     calib = Path(args.calib) if args.calib else None
     if calib is None:
         candidates = [bag / "calib.yaml", bag.parent / "calib.yaml", Path.cwd() / "calib.yaml",

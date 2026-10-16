@@ -1,5 +1,5 @@
 
-# USAGE: ros2 launch odin_ros_driver odin1_ros2.launch.py [pcd:=true] [pcd_voxel:=0.02] [record_bag:=true]
+# USAGE: ros2 launch odin_ros_driver odin1_ros2.launch.py [pcd:=true] [pcd_voxel:=0.02] [map_name:=lobby] [record_bag:=true]
 import os
 import time
 import yaml 
@@ -67,6 +67,11 @@ def generate_launch_description():
         'pcd_voxel',
         default_value='0.05',
         description='Voxel size in meters for the PCD map (smaller = denser, more RAM)'
+    )
+    map_name_arg = DeclareLaunchArgument(
+        'map_name',
+        default_value='rgb_map',
+        description='PCD map file name prefix; saved as <map_name>_<timestamp>.pcd'
     )
 
     # Record camera trajectory + images to a rosbag
@@ -142,6 +147,9 @@ def generate_launch_description():
         parameters=[overlay_params]
     )
 
+    # Shared by the PCD map and the bag so the console can pair them
+    run_stamp = time.strftime('%Y%m%d_%H%M%S')
+
     # RGB PCD map saver node - only started with pcd:=true
     pcd_map_saver_node = Node(
         package='odin_ros_driver',
@@ -149,7 +157,8 @@ def generate_launch_description():
         name='pcd_map_saver_node',
         output='screen',
         parameters=[{
-            'voxel_leaf_size': ParameterValue(LaunchConfiguration('pcd_voxel'), value_type=float)
+            'voxel_leaf_size': ParameterValue(LaunchConfiguration('pcd_voxel'), value_type=float),
+            'file_name': ParameterValue([LaunchConfiguration('map_name'), f'_{run_stamp}.pcd'], value_type=str)
         }],
         # Writing a large map on Ctrl+C takes minutes; don't let launch SIGKILL it mid-write
         sigterm_timeout='600',
@@ -158,7 +167,7 @@ def generate_launch_description():
     )
 
     # Rosbag recorder - only started with record_bag:=true
-    bag_name = 'camera_traj_' + time.strftime('%Y%m%d_%H%M%S')
+    bag_name = 'camera_traj_' + run_stamp
     bag_record = ExecuteProcess(
         cmd=['ros2', 'bag', 'record',
              '-o', [LaunchConfiguration('bag_dir'), '/' + bag_name],
@@ -201,6 +210,7 @@ def generate_launch_description():
     ld.add_action(rviz_config_arg)  # Add RViz configuration argument
     ld.add_action(pcd_arg)
     ld.add_action(pcd_voxel_arg)
+    ld.add_action(map_name_arg)
     ld.add_action(record_bag_arg)
     ld.add_action(bag_dir_arg)
     ld.add_action(bag_split_sec_arg)
